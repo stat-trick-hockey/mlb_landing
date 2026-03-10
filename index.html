@@ -45,7 +45,8 @@
       position: sticky;
       top: 0;
       z-index: 100;
-      overflow: hidden;
+      /* clip-path clips visually WITHOUT blocking pointer-events (unlike overflow:hidden) */
+      clip-path: inset(0);
     }
     .ticker-label {
       background: var(--accent);
@@ -66,15 +67,18 @@
     }
     .ticker-viewport {
       flex: 1;
-      overflow: hidden;
+      /* clip visually but allow pointer events through */
+      clip-path: inset(0);
       height: 100%;
       display: flex;
       align-items: center;
+      position: relative;
     }
     .ticker-track {
       display: flex;
       white-space: nowrap;
       will-change: transform;
+      cursor: default;
     }
     .ticker-item {
       font-family: 'Share Tech Mono', monospace;
@@ -92,12 +96,14 @@
       font-size: 7px;
     }
     .ticker-item a {
-      color: inherit;
+      color: var(--text);
       text-decoration: none;
       cursor: pointer;
     }
-    .ticker-item a:hover { color: var(--gold); text-decoration: underline; }
-    /* ticker uses JS rAF scroll — no CSS keyframes needed */
+    .ticker-item a:hover {
+      color: var(--gold);
+      text-decoration: underline;
+    }
 
     /* ── HERO ── */
     .hero {
@@ -447,72 +453,112 @@
   </footer>
 
   <script>
-    // ── RSS TICKER (rAF scroll — links truly clickable) ──────────────────────
-    const FEED_URL = 'https://www.mlb.com/feeds/news/rss.xml';
-    const PROXY    = 'https://api.allorigins.win/get?url=' + encodeURIComponent(FEED_URL);
+    // ── RSS TICKER ──────────────────────────────────────────────────────────────
+    // MLB Stats API — no CORS, no proxy needed
+    // Falls back to Baseball Reference / ESPN headlines via rss2json with their feeds
+
+    async function fetchMLBNews() {
+      const sig = { signal: AbortSignal.timeout(6000) };
+
+      // Strategy 1: ESPN MLB news RSS via rss2json (ESPN allows it)
+      try {
+        const espnFeed = 'https://www.espn.com/espn/rss/mlb/news';
+        const r = await fetch(`https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(espnFeed)}&count=18`, sig);
+        const d = await r.json();
+        console.log('ESPN rss2json:', d.status, d.items?.length);
+        if (d.status === 'ok' && d.items?.length) {
+          return d.items.map(i => ({ title: i.title?.trim(), link: i.link?.trim() }));
+        }
+      } catch(e) { console.warn('ESPN rss2json failed', e); }
+
+      // Strategy 2: CBS Sports MLB RSS
+      try {
+        const cbsFeed = 'https://www.cbssports.com/rss/headlines/mlb/';
+        const r = await fetch(`https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(cbsFeed)}&count=18`, sig);
+        const d = await r.json();
+        console.log('CBS rss2json:', d.status, d.items?.length);
+        if (d.status === 'ok' && d.items?.length) {
+          return d.items.map(i => ({ title: i.title?.trim(), link: i.link?.trim() }));
+        }
+      } catch(e) { console.warn('CBS rss2json failed', e); }
+
+      // Strategy 3: MLB Stats API — recent transactions (always works, no CORS)
+      try {
+        const today = new Date().toISOString().slice(0,10);
+        const r = await fetch(`https://statsapi.mlb.com/api/v1/transactions?sportId=1&startDate=2025-01-01&endDate=${today}&limit=30`, sig);
+        const d = await r.json();
+        console.log('MLB Stats API transactions:', d.transactions?.length);
+        if (d.transactions?.length) {
+          return d.transactions.slice(0, 18).map(t => ({
+            title: t.description || `${t.fromTeam?.name ?? ''} → ${t.toTeam?.name ?? ''}: ${t.player?.fullName ?? ''}`.trim(),
+            link: `https://www.mlb.com/player/${t.player?.id}`
+          })).filter(i => i.title.length > 3);
+        }
+      } catch(e) { console.warn('MLB Stats API failed', e); }
+
+      console.error('All sources failed');
+      return null;
+    }
 
     async function loadTicker() {
-      const track    = document.getElementById('ticker-track');
-      const viewport = track.closest('.ticker-viewport');
-      const speed    = 60; // px per second
+      const track = document.getElementById('ticker-track');
+      const wrap  = track.closest('.ticker-wrap');
+      const speed = 60;
 
-      let offset   = 0;
-      let paused   = false;
-      let halfWidth = 0;
-      let lastTime = null;
+      let offset = 0, paused = false, halfWidth = 0, lastTime = null;
 
-      // Pause scroll on hover so links can be clicked
-      viewport.addEventListener('mouseenter', () => { paused = true; });
-      viewport.addEventListener('mouseleave', () => { paused = false; });
-
-      function startScroll() {
-        function step(ts) {
-          if (lastTime === null) lastTime = ts;
-          const delta = ts - lastTime;
-          lastTime = ts;
-          if (!paused) {
-            offset += speed * (delta / 1000);
+      function step(ts) {
+        if (!paused) {
+          if (lastTime !== null) {
+            offset += speed * ((ts - lastTime) / 1000);
             if (halfWidth > 0 && offset >= halfWidth) offset -= halfWidth;
             track.style.transform = `translateX(-${offset}px)`;
           }
-          requestAnimationFrame(step);
+          lastTime = ts;
         }
         requestAnimationFrame(step);
       }
 
+      wrap.addEventListener('mouseenter', () => { paused = true;  lastTime = null; });
+      wrap.addEventListener('mouseleave', () => { paused = false; });
+
+      function makeItem(title, link) {
+        const safe = link?.startsWith('http') ? link : null;
+        if (safe) {
+          return `<span class="ticker-item"><a data-href="${safe}" href="${safe}" target="_blank" rel="noopener">${title}</a></span>`;
+        }
+        return `<span class="ticker-item">${title}</span>`;
+      }
+
       function buildTicker(items) {
-        track.innerHTML = items;
+        track.innerHTML = [...items, ...items].map(({ title, link }) => makeItem(title, link)).join('');
+        track.querySelectorAll('a[data-href]').forEach(a => {
+          a.addEventListener('click', e => {
+            e.stopPropagation();
+            window.open(a.dataset.href, '_blank', 'noopener');
+          });
+        });
         requestAnimationFrame(() => {
           halfWidth = track.scrollWidth / 2;
-          startScroll();
+          requestAnimationFrame(step);
         });
       }
 
-      try {
-        const res   = await fetch(PROXY);
-        const data  = await res.json();
-        const xml   = new DOMParser().parseFromString(data.contents, 'text/xml');
-        const nodes = Array.from(xml.querySelectorAll('item')).slice(0, 18);
-        if (!nodes.length) throw new Error('empty');
+      const items = await fetchMLBNews();
+      console.log('Final items:', items?.length, items?.[0]);
 
-        const html = [...nodes, ...nodes].map(item => {
-          const title = item.querySelector('title')?.textContent?.trim() || '';
-          const link  = item.querySelector('link')?.textContent?.trim()  || '#';
-          return `<span class="ticker-item"><a href="${link}" target="_blank" rel="noopener">${title}</a></span>`;
-        }).join('');
-
-        buildTicker(html);
-      } catch {
-        const fallbacks = [
-          'MLB 2025 season underway across 30 ballparks',
-          'Statcast tracking exit velocity on every batted ball',
-          'Spring training rosters finalized ahead of Opening Day',
-          'Pitch clock rules in effect for third straight season',
-          'Universal DH continues in both leagues',
-          'Home run leaderboard updated daily via Statcast feed'
-        ];
-        buildTicker([...fallbacks, ...fallbacks]
-          .map(t => `<span class="ticker-item">${t}</span>`).join(''));
+      if (items?.length) {
+        buildTicker(items);
+      } else {
+        console.warn('All RSS proxies failed — using fallback headlines');
+        buildTicker([
+          { title: 'MLB 2025 season underway across 30 ballparks',          link: 'https://www.mlb.com/news' },
+          { title: 'Statcast tracking exit velocity on every batted ball',   link: 'https://www.mlb.com/news' },
+          { title: 'Spring training rosters finalized ahead of Opening Day', link: 'https://www.mlb.com/news' },
+          { title: 'Pitch clock rules in effect for third straight season',  link: 'https://www.mlb.com/news' },
+          { title: 'Universal DH continues in both leagues',                 link: 'https://www.mlb.com/news' },
+          { title: 'Home run leaderboard updated daily via Statcast feed',   link: 'https://www.mlb.com/news' },
+        ]);
       }
     }
 
